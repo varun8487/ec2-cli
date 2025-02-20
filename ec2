@@ -258,6 +258,16 @@ class EC2Manager:
                     }]
                 }
                 
+                # Retrieve security groups from AMI tags if not provided
+                if security_group_ids is None:
+                    ami_details = self.ec2.describe_images(ImageIds=[ami_id])['Images'][0]
+                    source_security_groups_tag = next((tag['Value'] for tag in ami_details.get('Tags', []) if tag['Key'] == 'SecurityGroups'), None)
+                    if source_security_groups_tag:
+                        security_group_ids = source_security_groups_tag.split(',')
+                        launch_spec['NetworkInterfaces'][0]['Groups'] = security_group_ids
+                    else:
+                        security_group_ids = [] # Default to no security groups if not found in AMI tags
+                
                 if iam_role:
                     launch_spec['IamInstanceProfile'] = {'Name': iam_role}
                 
@@ -277,7 +287,7 @@ class EC2Manager:
                     {'Key': 'AssignPublicIp', 'Value': str(assign_public_ip)},
                     {'Key': 'SecurityGroups', 'Value': ','.join(security_group_ids if security_group_ids else [])}
                 ]
-
+                
                 if iam_role:
                     config_tags.append({'Key': 'IamRole', 'Value': iam_role})
                 if key_name:
