@@ -72,15 +72,7 @@ class EC2Manager:
             raise
 
     def get_instance_details(self, instance_id: str) -> Dict[str, Any]:
-        """
-        Get EC2 instance details, including name tag.
-
-        Args:
-            instance_id: EC2 instance ID
-
-        Returns:
-            dict: Instance details, including name
-        """
+        """Get EC2 instance details, including name tag."""
         try:
             response = self.ec2.describe_instances(InstanceIds=[instance_id])
             instance = response['Reservations'][0]['Instances'][0]
@@ -94,15 +86,7 @@ class EC2Manager:
             raise EC2ValidationError(f"Failed to get instance details: {str(e)}")
 
     def get_instance_config(self, instance_id: str) -> InstanceConfig:
-        """
-        Get instance network and security configuration
-        
-        Args:
-            instance_id: EC2 instance ID
-            
-        Returns:
-            InstanceConfig: Instance configuration details
-        """
+        """Get instance network and security configuration"""
         try:
             response = self.ec2.describe_instances(InstanceIds=[instance_id])
             instance = response['Reservations'][0]['Instances'][0]
@@ -117,7 +101,7 @@ class EC2Manager:
                     iam_role = iam_role['InstanceProfile']['Roles'][0]['RoleName']
                 except ClientError as e:
                     logger.warning(f"Could not retrieve IAM role for instance {instance_id}: {e}")
-                    iam_role = None # Set iam_role to None in case of failure
+                    iam_role = None
             
             # Check for public IP assignment
             network_interface = instance.get('NetworkInterfaces', [{}])[0]
@@ -218,7 +202,6 @@ class EC2Manager:
                     logger.error(f"Error creating AMI image: {e}")
                     return None
 
-
                 progress.add_task(description="Waiting for AMI to be available...", total=None)
                 waiter = self.ec2.get_waiter('image_available')
                 try:
@@ -243,47 +226,16 @@ class EC2Manager:
             logger.error(f"Unexpected error creating AMI: {str(e)}")
             return None
 
-    def get_ami_config(self, ami_id: str) -> Optional[InstanceConfig]:
-        """Get instance configuration from AMI tags"""
-        try:
-            response = self.ec2.describe_images(ImageIds=[ami_id])
-            if not response['Images']:
-                return None
-                
-            tags = {tag['Key']: tag['Value'] for tag in response['Images'][0].get('Tags', [])}
-            
-            return InstanceConfig(
-                vpc_id=tags.get('VpcId'),
-                subnet_id=tags.get('SubnetId'),
-                assign_public_ip=tags.get('AssignPublicIp', 'False').lower() == 'true',
-                iam_role=tags.get('IamRole'),
-                security_group_ids=tags.get('SecurityGroups', '').split(','),
-                key_name=tags.get('KeyName'),
-                tags=[{'Key': k, 'Value': v} for k, v in tags.items() 
-                     if k not in ['VpcId', 'SubnetId', 'AssignPublicIp', 'SecurityGroups', 
-                                'IamRole', 'KeyName', 'CreatedBy', 'CreatedAt']]
-            )
-        except ClientError as e:
-            logger.error(f"Error getting AMI configuration: {str(e)}")
-            return None
-
     def restore_instance(self, ami_identifier: str, instance_type: str,
-                        source_instance_id: Optional[str] = None) -> Optional[str]:
-        """Create new EC2 instance from AMI"""
+                        vpc_id: str, subnet_id: str,
+                        security_group_ids: Optional[List[str]] = None,
+                        key_name: Optional[str] = None,
+                        assign_public_ip: bool = False,
+                        iam_role: Optional[str] = None) -> Optional[str]:
+        """Create new EC2 instance from AMI with specified configuration"""
         try:
             ami_id = self.validate_ami_identifier(ami_identifier)
             self.validate_instance_type(instance_type)
-            
-            # Get configuration either from source instance or AMI tags
-            instance_config = None
-            if source_instance_id:
-                self.validate_instance_id(source_instance_id)
-                instance_config = self.get_instance_config(source_instance_id)
-            else:
-                instance_config = self.get_ami_config(ami_id)
-                
-            if not instance_config:
-                raise EC2ValidationError("Could not get instance configuration")
             
             with Progress(
                 SpinnerColumn(),
@@ -300,17 +252,17 @@ class EC2Manager:
                     'MinCount': 1,
                     'NetworkInterfaces': [{
                         'DeviceIndex': 0,
-                        'SubnetId': instance_config.subnet_id,
-                        'Groups': instance_config.security_group_ids,
-                        'AssociatePublicIpAddress': instance_config.assign_public_ip
+                        'SubnetId': subnet_id,
+                        'Groups': security_group_ids if security_group_ids else [],
+                        'AssociatePublicIpAddress': assign_public_ip
                     }]
                 }
                 
-                if instance_config.iam_role:
-                    launch_spec['IamInstanceProfile'] = {'Name': instance_config.iam_role}
+                if iam_role:
+                    launch_spec['IamInstanceProfile'] = {'Name': iam_role}
                 
-                if instance_config.key_name:
-                    launch_spec['KeyName'] = instance_config.key_name
+                if key_name:
+                    launch_spec['KeyName'] = key_name
                 
                 # Add tags
                 current_date = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
@@ -318,12 +270,22 @@ class EC2Manager:
                 ami_name = ami_details.get('Name', 'Unknown')
                 instance_name = f"{ami_name}-restored-{current_date}"
 
-                # Remove any existing 'Name' tag to avoid duplication
-                filtered_tags = [tag for tag in instance_config.tags if tag['Key'] != 'Name']
+                # Store configuration in tags
+                config_tags = [
+                    {'Key': 'VpcId', 'Value': vpc_id},
+                    {'Key': 'SubnetId', 'Value': subnet_id},
+                    {'Key': 'AssignPublicIp', 'Value': str(assign_public_ip)},
+                    {'Key': 'SecurityGroups', 'Value': ','.join(security_group_ids if security_group_ids else [])}
+                ]
+
+                if iam_role:
+                    config_tags.append({'Key': 'IamRole', 'Value': iam_role})
+                if key_name:
+                    config_tags.append({'Key': 'KeyName', 'Value': key_name})
 
                 launch_spec['TagSpecifications'] = [{
                     'ResourceType': 'instance',
-                    'Tags': filtered_tags + [
+                    'Tags': config_tags + [
                         {'Key': 'Name', 'Value': instance_name},
                         {'Key': 'CreatedBy', 'Value': 'ec2-cli'},
                         {'Key': 'SourceAMI', 'Value': ami_id},
@@ -378,7 +340,7 @@ def backup(instance_id: str, wait: bool, timeout: int):
     try:
         manager = EC2Manager()
         ami_id = manager.create_ami(instance_id, timeout=timeout)
-        
+
         if ami_id:
             result = {
                 'status': 'success',
@@ -405,22 +367,33 @@ def backup(instance_id: str, wait: bool, timeout: int):
         }
         console.print(json.dumps(error_result, indent=2))
         sys.exit(1)
-              
+
 @cli.command()
 @click.argument('ami-identifier')
-@click.argument('instance-type')
-@click.option('--source-instance', help='Source instance ID to copy configuration from')
+@click.option('--instance-type', required=True, help='EC2 instance type')
+@click.option('--vpc-id', required=True, help='VPC ID')
+@click.option('--subnet-id', required=True, help='Subnet ID')
+@click.option('--security-group-ids', multiple=True, help='Security group IDs')
+@click.option('--key-name', help='EC2 key pair name')
+@click.option('--assign-public-ip/--no-assign-public-ip', default=False, help='Assign public IP')
+@click.option('--iam-role', help='IAM role name')
 @click.option('--wait/--no-wait', default=True, help='Wait for instance to be running')
 @click.option('--timeout', default=600, help='Maximum time to wait for instance launch in seconds')
-def restore(ami_identifier: str, instance_type: str, source_instance: Optional[str], 
-           wait: bool, timeout: int):
-    """Create a new EC2 instance from an AMI"""
+def restore(ami_identifier: str, instance_type: str, vpc_id: str, subnet_id: str,
+        security_group_ids: tuple, key_name: Optional[str], assign_public_ip: bool,
+        iam_role: Optional[str], wait: bool, timeout: int):
+    """Create a new EC2 instance from an AMI with specified configuration"""
     try:
         manager = EC2Manager()
         instance_id = manager.restore_instance(
-            ami_identifier, 
-            instance_type,
-            source_instance_id=source_instance
+            ami_identifier=ami_identifier,
+            instance_type=instance_type,
+            vpc_id=vpc_id,
+            subnet_id=subnet_id,
+            security_group_ids=list(security_group_ids) if security_group_ids else None,
+            key_name=key_name,
+            assign_public_ip=assign_public_ip,
+            iam_role=iam_role
         )
         
         if instance_id:
@@ -429,7 +402,12 @@ def restore(ami_identifier: str, instance_type: str, source_instance: Optional[s
                 'instance_id': instance_id,
                 'ami_identifier': ami_identifier,
                 'instance_type': instance_type,
-                'source_instance': source_instance,
+                'vpc_id': vpc_id,
+                'subnet_id': subnet_id,
+                'security_group_ids': list(security_group_ids) if security_group_ids else None,
+                'key_name': key_name,
+                'assign_public_ip': assign_public_ip,
+                'iam_role': iam_role,
                 'timestamp': datetime.now().isoformat()
             }
             console.print(json.dumps(result, indent=2))
